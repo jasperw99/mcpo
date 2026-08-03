@@ -14,10 +14,12 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.routing import Mount
 
+import httpx2
+
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 from mcpo.utils.auth import APIKeyMiddleware, get_verify_api_key
 from mcpo.utils.main import (
@@ -51,6 +53,27 @@ class GracefulShutdown:
         """Track tasks for cleanup"""
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
+
+
+@asynccontextmanager
+async def _streamable_http_client_context(
+    url: str,
+    headers: Optional[Dict[str, str]],
+    auth: Optional[Any] = None,
+):
+    """Create a streamable HTTP client context with its own httpx2 client."""
+    http_client = httpx2.AsyncClient(
+        headers=headers,
+        auth=auth,
+        follow_redirects=True,
+        timeout=httpx2.Timeout(30, read=300),
+    )
+    async with http_client:
+        async with streamable_http_client(
+            url=url,
+            http_client=http_client,
+        ) as streams:
+            yield streams
 
 
 class MCPConnectionManager:
@@ -178,7 +201,7 @@ class MCPConnectionManager:
                 headers=self.headers,
             )
         if self.server_type == "streamable-http":
-            return streamablehttp_client(
+            return _streamable_http_client_context(
                 url=self.args[0],
                 headers=self.headers,
                 auth=self.auth_provider,
@@ -503,7 +526,7 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
         if not session:
             raise ValueError("Session is not initialized in the app state.")
         result = await session.initialize()
-    server_info = getattr(result, "serverInfo", None)
+    server_info = getattr(result, "server_info", None)
     if server_info:
         app.title = server_info.name or app.title
         app.description = (
@@ -531,23 +554,23 @@ async def create_dynamic_endpoints(app: FastAPI, api_dependency=None):
         endpoint_name = tool.name
         endpoint_description = tool.description
 
-        inputSchema = tool.inputSchema
-        outputSchema = getattr(tool, "outputSchema", None)
+        input_schema = tool.input_schema
+        output_schema = getattr(tool, "output_schema", None)
 
         form_model_fields = get_model_fields(
             f"{endpoint_name}_form_model",
-            inputSchema.get("properties", {}),
-            inputSchema.get("required", []),
-            inputSchema.get("$defs", {}),
+            input_schema.get("properties", {}),
+            input_schema.get("required", []),
+            input_schema.get("$defs", {}),
         )
 
         response_model_fields = None
-        if outputSchema:
+        if output_schema:
             response_model_fields = get_model_fields(
                 f"{endpoint_name}_response_model",
-                outputSchema.get("properties", {}),
-                outputSchema.get("required", []),
-                outputSchema.get("$defs", {}),
+                output_schema.get("properties", {}),
+                output_schema.get("required", []),
+                output_schema.get("$defs", {}),
             )
 
         # Get client header forwarding configuration from app state
@@ -791,7 +814,7 @@ async def run(
 
     # Apply filter to suppress HTTP request logs
     logging.getLogger("uvicorn.access").addFilter(HTTPRequestFilter())
-    logging.getLogger("httpx.access").addFilter(HTTPRequestFilter())
+    logging.getLogger("httpx2.access").addFilter(HTTPRequestFilter())
     logger.info("Starting MCPO Server...")
     logger.info(f"  Name: {name}")
     logger.info(f"  Version: {version}")
